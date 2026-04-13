@@ -273,19 +273,64 @@ export function InvoiceApp() {
             onClick={onStart}
             disabled={busy || selectedFiles.length === 0}
           >
-            {busy ? (
-              <><Spinner /> Processing...</>
-            ) : (
-              <>&#9654; Start Processing ({selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""})</>
-            )}
+            &#9654; Start Processing ({selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""})
           </button>
+
+          {/* Upload-phase loading overlay */}
+          {busy && (
+            <div className="mt-4 flex items-center gap-3 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
+              <Spinner />
+              <span>
+                Uploading {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""} to server… please wait
+              </span>
+            </div>
+          )}
         </section>
       )}
 
       {/* ── Progress ── */}
       {batch && !batch.completed && (
-        <section className="panel space-y-4">
+        <section className="panel space-y-5">
           <h2 className="section-title">Processing</h2>
+
+          {/* Big % + bar */}
+          <div className="flex items-center gap-5">
+            {/* Percentage ring */}
+            <div className="relative flex h-20 w-20 shrink-0 items-center justify-center">
+              <svg className="absolute inset-0 -rotate-90" viewBox="0 0 80 80">
+                <circle cx="40" cy="40" r="34" fill="none" stroke="#e2e8f0" strokeWidth="8" />
+                <circle
+                  cx="40" cy="40" r="34" fill="none"
+                  stroke="#0f766e" strokeWidth="8"
+                  strokeLinecap="round"
+                  strokeDasharray={`${2 * Math.PI * 34}`}
+                  strokeDashoffset={`${2 * Math.PI * 34 * (1 - batch.progress.percentage / 100)}`}
+                  className="transition-all duration-500"
+                />
+              </svg>
+              <span className="text-lg font-bold text-ink">{batch.progress.percentage}%</span>
+            </div>
+
+            {/* Counts + stage */}
+            <div className="flex-1 space-y-2">
+              <div className="flex items-baseline gap-2">
+                <span className="text-3xl font-bold text-ink">{batch.progress.processed}</span>
+                <span className="text-sm text-slate-400">/ {batch.progress.total} invoices</span>
+              </div>
+              <div className="flex items-center gap-2 text-sm text-slate-500">
+                <Spinner />
+                <span>{batch.progress.stage}</span>
+              </div>
+              {/* Bar */}
+              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className="h-2 rounded-full bg-accent transition-all duration-500"
+                  style={{ width: `${batch.progress.percentage}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
           {/* Step indicators */}
           <div className="flex items-center gap-1">
             {STAGE_STEPS.map((step, i) => {
@@ -309,19 +354,7 @@ export function InvoiceApp() {
               );
             })}
           </div>
-          {/* Progress bar */}
-          <div>
-            <div className="mb-1 flex justify-between text-xs text-slate-500">
-              <span>{batch.progress.stage}</span>
-              <span>{batch.progress.processed} / {batch.progress.total}</span>
-            </div>
-            <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-200">
-              <div
-                className="h-2.5 rounded-full bg-accent transition-all duration-300"
-                style={{ width: `${batch.progress.percentage}%` }}
-              />
-            </div>
-          </div>
+
           {/* Live counters */}
           <div className="flex gap-4 text-sm">
             <span className="text-emerald-600">✓ Valid {batch.progress.valid}</span>

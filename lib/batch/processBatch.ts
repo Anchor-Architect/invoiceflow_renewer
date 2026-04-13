@@ -55,7 +55,9 @@ export const processBatch = async (batchId: string): Promise<void> => {
   const batch = getBatch(batchId);
   if (!batch) throw new Error("Batch not found");
 
-  const concurrency = Math.max(1, Number(process.env.INVOICE_CONCURRENCY || 5));
+  // Default concurrency of 2 avoids Claude API rate limits on lower tiers.
+  // Raise via INVOICE_CONCURRENCY env var if on Tier 2+ (1,000 RPM).
+  const concurrency = Math.max(1, Number(process.env.INVOICE_CONCURRENCY || 2));
   const results: ProcessedInvoice[] = [];
   const allTokenUsages: TokenUsage[] = [];
 

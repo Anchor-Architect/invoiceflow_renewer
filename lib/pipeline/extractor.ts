@@ -24,6 +24,37 @@ const extractJsonObject = (input: string): string => {
   return input.slice(start, end + 1);
 };
 
+// Exponential backoff: waits 2^attempt * base ms, capped at maxMs
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withRetry = async <T>(
+  fn: () => Promise<T>,
+  maxAttempts = 5,
+  baseDelayMs = 2000
+): Promise<T> => {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? error.message : String(error);
+      const isRateLimit =
+        msg.includes("rate_limit") ||
+        msg.includes("429") ||
+        msg.includes("overloaded") ||
+        msg.includes("529");
+
+      if (!isRateLimit) throw error; // non-rate-limit errors bubble up immediately
+
+      const delayMs = Math.min(baseDelayMs * 2 ** attempt, 60_000);
+      console.warn(`Rate limit hit (attempt ${attempt + 1}/${maxAttempts}). Retrying in ${delayMs}ms…`);
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
+};
+
 type CompactExtraction = {
   invoice_number: string | null;
   invoice_serial: string | null;
@@ -67,24 +98,23 @@ export const extractInvoiceStructured = async (invoiceText: string): Promise<Ext
   // Vietnamese invoices are compact; 5000 chars is more than enough
   const textToSend = invoiceText.slice(0, 5000);
 
-  let response;
-  try {
-    response = await anthropic.messages.create({
+  const response = await withRetry(() =>
+    anthropic.messages.create({
       model,
       temperature: 0,
       max_tokens: 500,
       system: prompt,
       messages: [{ role: "user", content: `Extract from invoice:\n\n${textToSend}` }]
-    });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes("not_found_error") || msg.includes("model")) {
-      throw new Error(
-        `CLAUDE_MODEL is invalid or unavailable: ${model}. Set CLAUDE_MODEL to a valid model like claude-haiku-4-5-20251001.`
-      );
-    }
-    throw error;
-  }
+    }).catch((error) => {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes("not_found_error") || msg.includes("model")) {
+        throw new Error(
+          `CLAUDE_MODEL is invalid or unavailable: ${model}. Set CLAUDE_MODEL to a valid model like claude-haiku-4-5-20251001.`
+        );
+      }
+      throw error;
+    })
+  );
 
   const text = response.content
     .filter((c) => c.type === "text")
