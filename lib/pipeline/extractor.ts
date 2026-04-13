@@ -107,7 +107,9 @@ export const extractInvoiceStructured = async (invoiceText: string): Promise<Ext
       messages: [{ role: "user", content: `Extract from invoice:\n\n${textToSend}` }]
     }).catch((error) => {
       const msg = error instanceof Error ? error.message : String(error);
-      if (msg.includes("not_found_error") || msg.includes("model")) {
+      // Only catch genuine model-not-found errors, not rate limits or other errors
+      // that happen to contain the word "model"
+      if (msg.includes("not_found_error") || msg.includes("model_not_found")) {
         throw new Error(
           `CLAUDE_MODEL is invalid or unavailable: ${model}. Set CLAUDE_MODEL to a valid model like claude-haiku-4-5-20251001.`
         );
