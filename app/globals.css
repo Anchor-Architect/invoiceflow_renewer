@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-surface text-ink;
+}
+
+.panel {
+  @apply rounded-xl border border-slate-200 bg-white p-4 shadow-sm;
+}
+
+.section-title {
+  @apply mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600;
+}
