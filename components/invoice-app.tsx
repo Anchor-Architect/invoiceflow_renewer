@@ -7,13 +7,12 @@ import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/in
 
 type ApiError = { error: string };
 
-const UPLOAD_CONCURRENCY = 2; // keep low — Render proxy throttles concurrent POSTs
+const AI_CONCURRENCY = 2; // parallel Claude API calls
 
-// If user uploaded a ZIP, extract PDFs from it client-side before uploading.
-// This avoids sending one large ZIP request through Render's proxy.
+// Extract PDFs from ZIP client-side (avoids uploading large files to server)
 const expandToPdfs = async (inputFiles: File[]): Promise<File[]> => {
   const zipFile = inputFiles.find((f) => f.name.toLowerCase().endsWith(".zip"));
-  if (!zipFile) return inputFiles;
+  if (!zipFile) return inputFiles.filter((f) => f.name.toLowerCase().endsWith(".pdf"));
 
   const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(await zipFile.arrayBuffer());
@@ -33,109 +32,99 @@ const expandToPdfs = async (inputFiles: File[]): Promise<File[]> => {
   return pdfFiles;
 };
 
-// Upload one file via XHR — each request is ~300 KB, bypassing Render proxy throttle
-const uploadOneFile = (
-  batchId: string,
-  file: File,
-  onBytes: (loaded: number, total: number) => void
-): Promise<{ fileId: string; fileName: string; filePath: string }> => {
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-    const xhr = new XMLHttpRequest();
-    xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) onBytes(e.loaded, e.total);
-    });
-    xhr.addEventListener("load", () => {
-      try {
-        const data = JSON.parse(xhr.responseText);
-        if (xhr.status >= 200 && xhr.status < 300 && "fileId" in data) resolve(data);
-        else reject(new Error(data.error ?? "Failed to upload file"));
-      } catch {
-        reject(new Error("Failed to parse server response"));
-      }
-    });
-    xhr.addEventListener("error", () => reject(new Error(`Network error uploading ${file.name}`)));
-    xhr.timeout = 30_000; // 30s per file — plenty for ~300 KB
-    xhr.addEventListener("timeout", () => reject(new Error(`Upload timed out: ${file.name}`)));
-    xhr.open("POST", `/api/batches/${batchId}/file`);
-    xhr.send(form);
-  });
+// Extract plain text from a PDF file in the browser using PDF.js
+const extractTextFromPdf = async (file: File): Promise<string> => {
+  const pdfjsLib = await import("pdfjs-dist");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  let fullText = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((item) => ("str" in item ? item.str : ""))
+      .join(" ");
+    fullText += pageText + "\n";
+  }
+  return fullText.replace(/\s+\n/g, "\n").trim();
 };
 
-// Parallel upload: extract ZIP if needed → init batch → upload files N at a time → finalize
-const uploadFiles = async (
-  files: File[],
-  onProgress: (pct: number) => void
-): Promise<BatchState> => {
-  // Step 0: extract ZIP client-side (so we never send a large single request)
-  const pdfs = await expandToPdfs(files);
-
-  // Step 1: init empty batch
-  const initRes = await fetch("/api/batches/init", {
+// Send extracted text to server for AI analysis (tiny JSON, no file upload)
+const analyzeInvoice = async (
+  fileName: string,
+  text: string
+): Promise<ProcessedInvoice> => {
+  const res = await fetch("/api/process-invoice", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ total: pdfs.length })
+    body: JSON.stringify({ fileName, text })
   });
-  const initData = (await initRes.json()) as { batch: BatchState } | ApiError;
-  if (!initRes.ok || !("batch" in initData)) {
-    throw new Error("error" in initData ? initData.error : "Failed to init batch");
+  const data = (await res.json()) as { result: ProcessedInvoice } | ApiError;
+  if (!res.ok || !("result" in data)) {
+    throw new Error("error" in data ? data.error : "Analysis failed");
   }
-  const batchId = initData.batch.id;
+  return data.result;
+};
 
-  // Step 2: upload all files in parallel (UPLOAD_CONCURRENCY at a time)
-  const totalBytes = pdfs.reduce((s, f) => s + f.size, 0);
-  const bytesPerFile = new Array(pdfs.length).fill(0);
-  const uploadedFiles: { fileId: string; fileName: string; filePath: string }[] = [];
-
-  const queue = [...pdfs.entries()]; // [[index, file], ...]
-  const workers = Array.from({ length: UPLOAD_CONCURRENCY }, async () => {
-    while (queue.length > 0) {
-      const next = queue.shift();
-      if (!next) break;
-      const [idx, file] = next;
-      const result = await uploadOneFile(batchId, file, (loaded, total) => {
-        bytesPerFile[idx] = (loaded / total) * file.size;
-        const sent = bytesPerFile.reduce((s, b) => s + b, 0);
-        onProgress(Math.min(Math.round((sent / totalBytes) * 100), 99));
+// Detect duplicates client-side (same logic as server)
+const detectDuplicates = (invoices: ProcessedInvoice[]): void => {
+  const keyMap = new Map<string, string[]>();
+  for (const inv of invoices) {
+    if (!inv.duplicateKey) continue;
+    const arr = keyMap.get(inv.duplicateKey) ?? [];
+    arr.push(inv.fileId);
+    keyMap.set(inv.duplicateKey, arr);
+  }
+  for (const inv of invoices) {
+    if (!inv.duplicateKey) continue;
+    if ((keyMap.get(inv.duplicateKey)?.length ?? 0) > 1) {
+      inv.reasons.push({
+        type: "Duplicate",
+        reason: "The same invoice_number + seller_tax_code appears more than once in this batch",
+        evidence: [`duplicate_key=${inv.duplicateKey}`]
       });
-      uploadedFiles.push(result);
+      if (inv.status !== "failed") {
+        inv.status = "review-needed";
+        inv.purchaseRow = null;
+        inv.salesRow = null;
+      }
     }
-  });
-  await Promise.all(workers);
+  }
+};
 
-  // Step 3: finalize — commit file list to state.json
-  const finalizeRes = await fetch(`/api/batches/${batchId}/finalize`, {
+// Aggregate token summary from processed invoices
+const buildTokenSummary = (invoices: ProcessedInvoice[]): BatchTokenSummary | null => {
+  const usages = invoices.filter((i) => i.tokenUsage != null).map((i) => i.tokenUsage!);
+  if (usages.length === 0) return null;
+  const model = usages[0].model;
+  const totalInput = usages.reduce((s, t) => s + t.input, 0);
+  const totalOutput = usages.reduce((s, t) => s + t.output, 0);
+  const price = getPricePerM(model);
+  return {
+    totalInput,
+    totalOutput,
+    model,
+    estimatedCostUsd: (totalInput * price.input + totalOutput * price.output) / 1_000_000
+  };
+};
+
+// Insert valid invoices to Google Sheets
+const insertToSheets = async (
+  invoices: ProcessedInvoice[]
+): Promise<BatchState["insertSummary"]> => {
+  const res = await fetch("/api/insert", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ files: uploadedFiles })
+    body: JSON.stringify({ invoices })
   });
-  const finalizeData = (await finalizeRes.json()) as { batch: BatchState } | ApiError;
-  if (!finalizeRes.ok || !("batch" in finalizeData)) {
-    throw new Error("error" in finalizeData ? finalizeData.error : "Failed to finalize batch");
+  const data = (await res.json()) as { summary: BatchState["insertSummary"] } | ApiError;
+  if (!res.ok || !("summary" in data)) {
+    throw new Error("error" in data ? data.error : "Insertion failed");
   }
-
-  onProgress(100);
-  return finalizeData.batch;
-};
-
-const startProcessing = async (batchId: string): Promise<void> => {
-  const res = await fetch(`/api/batches/${batchId}/process`, { method: "POST" });
-  if (!res.ok) throw new Error(((await res.json()) as ApiError).error || "Failed to start processing");
-};
-
-const fetchProgress = async (batchId: string): Promise<BatchState> => {
-  const res = await fetch(`/api/batches/${batchId}/progress`, { cache: "no-store" });
-  const data = (await res.json()) as { batch: BatchState } | ApiError;
-  if (!res.ok || !("batch" in data)) throw new Error("error" in data ? data.error : "Failed to fetch progress");
-  return data.batch;
-};
-
-const insertRows = async (batchId: string): Promise<BatchState> => {
-  const res = await fetch(`/api/batches/${batchId}/insert`, { method: "POST" });
-  const data = (await res.json()) as { batch: BatchState } | ApiError;
-  if (!res.ok || !("batch" in data)) throw new Error("error" in data ? data.error : "Failed to insert rows");
-  return data.batch;
+  return data.summary;
 };
 
 // ─── Cost helpers ────────────────────────────────────────────────────────────
@@ -223,76 +212,129 @@ export function InvoiceApp() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
-  const [uploadPhase, setUploadPhase] = useState<"extracting-zip" | "uploading" | "saving">("uploading");
+  const [uploadPhase, setUploadPhase] = useState<"extracting-zip" | "extracting-text" | "analyzing">("extracting-zip");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showTokenTable, setShowTokenTable] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [activeTab, setActiveTab] = useState<"all" | "valid" | "review" | "failed">("all");
   const [previewTab, setPreviewTab] = useState<"Purchase" | "Sales">("Purchase");
-  const pollRef = useRef<number | null>(null);
-
-  const stopPolling = () => {
-    if (pollRef.current !== null) { window.clearInterval(pollRef.current); pollRef.current = null; }
-  };
-  const beginPolling = (id: string) => {
-    stopPolling();
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const updated = await fetchProgress(id);
-        setBatch(updated);
-        if (updated.completed) stopPolling();
-      } catch (e) {
-        stopPolling();
-        setError(e instanceof Error ? e.message : "Failed to fetch progress");
-      }
-    }, 1000);
-  };
 
   const onDropFiles = (incoming: FileList | null) => {
     if (!incoming) return;
     setSelectedFiles(Array.from(incoming));
     setError(null);
     setBatch(null);
-    stopPolling();
   };
 
   const onStart = async () => {
     try {
       setBusy(true);
       setError(null);
-      setUploadPct(0);
-      // If ZIP, show extraction phase first
-      if (selectedFiles.some((f) => f.name.toLowerCase().endsWith(".zip"))) {
-        setUploadPhase("extracting-zip");
-      } else {
-        setUploadPhase("uploading");
-      }
-      const created = await uploadFiles(selectedFiles, (pct) => {
-        setUploadPhase("uploading");
-        setUploadPct(pct);
-      });
       setUploadPct(null);
-      setBatch(created);
-      await startProcessing(created.id);
-      beginPolling(created.id);
-    } catch (e) {
-      setUploadPct(null);
-      setError(e instanceof Error ? e.message : "Failed to start processing");
-    } finally {
-      setBusy(false);
-    }
-  };
 
-  // Resume processing after a server restart — re-triggers /process which skips already-done invoices
-  const onResume = async () => {
-    if (!batch) return;
-    try {
-      setBusy(true);
-      setError(null);
-      await startProcessing(batch.id);
-      beginPolling(batch.id);
+      // Step 1: extract PDFs from ZIP client-side
+      setUploadPhase("extracting-zip");
+      const pdfs = await expandToPdfs(selectedFiles);
+      if (pdfs.length > 200) throw new Error("Maximum 200 invoice PDFs per batch");
+
+      const batchId = `local-${Date.now().toString(36)}`;
+      const now = new Date().toISOString();
+
+      // Initialize local batch state (no server needed for processing)
+      const localBatch: BatchState = {
+        id: batchId,
+        createdAt: now,
+        files: pdfs.map((f, i) => ({ id: String(i), name: f.name })),
+        processedInvoices: [],
+        progress: { percentage: 0, processed: 0, total: pdfs.length, stage: "Extracting text", valid: 0, reviewNeeded: 0, failed: 0 },
+        started: true,
+        completed: false,
+        insertSummary: null,
+        tokenSummary: null
+      };
+      setBatch(localBatch);
+
+      // Step 2: extract text from each PDF client-side (no upload to server!)
+      setUploadPhase("extracting-text");
+      const texts: { file: File; text: string }[] = [];
+      for (let i = 0; i < pdfs.length; i++) {
+        const text = await extractTextFromPdf(pdfs[i]);
+        texts.push({ file: pdfs[i], text });
+        setUploadPct(Math.round(((i + 1) / pdfs.length) * 100));
+      }
+      setUploadPct(null);
+
+      // Step 3: analyze each invoice via AI (tiny JSON requests, no file upload)
+      setUploadPhase("analyzing");
+      const results: ProcessedInvoice[] = [];
+      const queue = [...texts];
+      let processed = 0;
+
+      const workers = Array.from({ length: AI_CONCURRENCY }, async () => {
+        while (queue.length > 0) {
+          const next = queue.shift();
+          if (!next) break;
+          let result: ProcessedInvoice;
+          try {
+            result = await analyzeInvoice(next.file.name, next.text);
+          } catch (e) {
+            result = {
+              fileId: `err-${Date.now()}`,
+              fileName: next.file.name,
+              type: "Unknown",
+              status: "failed",
+              extraction: null,
+              validation: null,
+              purchaseRow: null,
+              salesRow: null,
+              reasons: [{ type: "Processing failed", reason: e instanceof Error ? e.message : "Unknown error", evidence: [] }],
+              rawTextSnippet: null,
+              duplicateKey: undefined,
+              tokenUsage: null
+            };
+          }
+          results.push(result);
+          processed++;
+          // Update UI after each invoice
+          setBatch((prev) => {
+            if (!prev) return prev;
+            const valid = results.filter((r) => r.status === "valid").length;
+            const reviewNeeded = results.filter((r) => r.status === "review-needed").length;
+            const failed = results.filter((r) => r.status === "failed").length;
+            return {
+              ...prev,
+              processedInvoices: [...results],
+              progress: {
+                ...prev.progress,
+                stage: "Analyzing invoice",
+                processed,
+                percentage: Math.round((processed / pdfs.length) * 100),
+                valid,
+                reviewNeeded,
+                failed
+              }
+            };
+          });
+        }
+      });
+      await Promise.all(workers);
+
+      // Step 4: detect duplicates & finalize
+      detectDuplicates(results);
+      const tokenSummary = buildTokenSummary(results);
+      const sorted = [...results].sort((a, b) => a.fileName.localeCompare(b.fileName));
+
+      setBatch((prev) => prev ? {
+        ...prev,
+        processedInvoices: sorted,
+        tokenSummary,
+        completed: true,
+        progress: { ...prev.progress, percentage: 100, stage: "Ready for insertion", processed: pdfs.length }
+      } : prev);
+
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to resume processing");
+      setUploadPct(null);
+      setError(e instanceof Error ? e.message : "Failed to process invoices");
     } finally {
       setBusy(false);
     }
@@ -303,7 +345,8 @@ export function InvoiceApp() {
     try {
       setBusy(true);
       setError(null);
-      setBatch(await insertRows(batch.id));
+      const summary = await insertToSheets(batch.processedInvoices);
+      setBatch((prev) => prev ? { ...prev, insertSummary: summary } : prev);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to insert rows");
     } finally {
@@ -409,37 +452,25 @@ export function InvoiceApp() {
           </button>
 
           {/* Upload-phase loading overlay */}
-          {busy && (
+          {busy && !batch && (
             <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
               {uploadPhase === "extracting-zip" ? (
-                /* Step 0: extracting ZIP client-side */
                 <div className="flex items-center gap-2">
                   <Spinner />
-                  <span>Extracting ZIP file… please wait</span>
+                  <span>Extracting ZIP file…</span>
                 </div>
-              ) : uploadPct !== null ? (
-                /* Step 1: chunked network upload with real % */
+              ) : uploadPhase === "extracting-text" && uploadPct !== null ? (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Spinner />
-                      <span>Uploading to server…</span>
-                    </div>
+                    <div className="flex items-center gap-2"><Spinner /><span>Reading PDF text…</span></div>
                     <span className="font-semibold">{uploadPct}%</span>
                   </div>
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-teal-200">
-                    <div
-                      className="h-full rounded-full bg-teal-500 transition-all duration-300"
-                      style={{ width: `${uploadPct}%` }}
-                    />
+                    <div className="h-full rounded-full bg-teal-500 transition-all duration-300" style={{ width: `${uploadPct}%` }} />
                   </div>
                 </div>
               ) : (
-                /* Step 2: saving on server */
-                <div className="flex items-center gap-2">
-                  <Spinner />
-                  <span>Saving files on server… please wait</span>
-                </div>
+                <div className="flex items-center gap-2"><Spinner /><span>Starting AI analysis…</span></div>
               )}
             </div>
           )}
@@ -745,16 +776,6 @@ export function InvoiceApp() {
             <p className="font-semibold">Error</p>
             <p className="mt-0.5 text-xs">{error}</p>
           </div>
-          {/* Show Resume button if server restarted mid-processing */}
-          {error.includes("restarted") && batch && !batch.completed && (
-            <button
-              onClick={onResume}
-              disabled={busy}
-              className="shrink-0 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50"
-            >
-              ↻ Resume Processing
-            </button>
-          )}
         </div>
       )}
     </main>
