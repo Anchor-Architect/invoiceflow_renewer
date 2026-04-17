@@ -7,7 +7,9 @@ type InternalBatchState = BatchState & {
   sourceFiles: { id: string; name: string; filePath: string }[];
 };
 
-const DATA_DIR = path.join(process.cwd(), ".data", "batches");
+// On Render: mount a Persistent Disk at /data and set BATCH_DATA_DIR=/data/batches
+// This survives instance restarts; without it, state is lost if the instance recycles.
+const DATA_DIR = process.env.BATCH_DATA_DIR || path.join(process.cwd(), ".data", "batches");
 
 const ensureDataDir = () => {
   fs.mkdirSync(DATA_DIR, { recursive: true });

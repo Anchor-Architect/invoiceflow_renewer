@@ -10,7 +10,12 @@ export async function GET(
   const { batchId } = await context.params;
   const batch = getBatch(batchId);
   if (!batch) {
-    return NextResponse.json({ error: "Batch not found" }, { status: 404 });
+    // The server may have restarted and lost ephemeral state.
+    // Return a clear message so the client can surface a useful error instead of polling forever.
+    return NextResponse.json(
+      { error: "Batch not found. The server may have restarted — please re-upload your files." },
+      { status: 404 }
+    );
   }
 
   return NextResponse.json({ batch: publicBatch(batch) });
