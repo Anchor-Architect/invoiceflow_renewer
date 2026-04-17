@@ -18,15 +18,13 @@ export const extractPdfsFromZip = async (
     (entry) => !entry.dir && entry.name.toLowerCase().endsWith(".pdf")
   );
 
-  const files: UploadedPdf[] = [];
-  for (const entry of pdfEntries) {
-    const content = await entry.async("nodebuffer");
-    files.push({
+  const files = await Promise.all(
+    pdfEntries.map(async (entry) => ({
       id: createId(),
       name: entry.name.split("/").at(-1) ?? entry.name,
-      buffer: content
-    });
-  }
+      buffer: await entry.async("nodebuffer")
+    }))
+  );
 
   return files;
 };

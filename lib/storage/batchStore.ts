@@ -27,17 +27,20 @@ const writeState = (state: InternalBatchState) => {
 const createId = () =>
   `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-export const createBatch = (files: UploadedPdf[]): InternalBatchState => {
+export const createBatch = async (files: UploadedPdf[]): Promise<InternalBatchState> => {
   const id = createId();
   ensureDataDir();
   fs.mkdirSync(batchDir(id), { recursive: true });
 
-  const sourceFiles = files.map((f) => {
-    const safeName = path.basename(f.name).replace(/[^a-zA-Z0-9._-]/g, "_");
-    const filePath = path.join(batchDir(id), `${f.id}-${safeName}`);
-    fs.writeFileSync(filePath, f.buffer);
-    return { id: f.id, name: f.name, filePath };
-  });
+  // Write all PDF files to disk in parallel (much faster than sequential sync writes)
+  const sourceFiles = await Promise.all(
+    files.map(async (f) => {
+      const safeName = path.basename(f.name).replace(/[^a-zA-Z0-9._-]/g, "_");
+      const filePath = path.join(batchDir(id), `${f.id}-${safeName}`);
+      await fs.promises.writeFile(filePath, f.buffer);
+      return { id: f.id, name: f.name, filePath };
+    })
+  );
 
   const state: InternalBatchState = {
     id,

@@ -3,6 +3,7 @@ import { createBatch, publicBatch } from "@/lib/storage/batchStore";
 import { ingestUploadedFiles } from "@/lib/pdf/ingest";
 
 export const runtime = "nodejs";
+export const maxDuration = 60; // allow up to 60s for large ZIP uploads + extraction
 
 export async function POST(request: Request) {
   try {
@@ -10,7 +11,7 @@ export async function POST(request: Request) {
     const files = form.getAll("files").filter((f): f is File => f instanceof File);
 
     const uploadedPdfs = await ingestUploadedFiles(files);
-    const batch = createBatch(uploadedPdfs);
+    const batch = await createBatch(uploadedPdfs);
 
     return NextResponse.json({ batch: publicBatch(batch) });
   } catch (error) {

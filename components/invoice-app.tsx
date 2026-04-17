@@ -7,13 +7,42 @@ import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/in
 
 type ApiError = { error: string };
 
-const uploadFiles = async (files: File[]): Promise<BatchState> => {
-  const form = new FormData();
-  files.forEach((f) => form.append("files", f));
-  const res = await fetch("/api/batches", { method: "POST", body: form });
-  const data = (await res.json()) as { batch: BatchState } | ApiError;
-  if (!res.ok || !("batch" in data)) throw new Error("error" in data ? data.error : "Failed to upload files");
-  return data.batch;
+const uploadFiles = (
+  files: File[],
+  onProgress: (pct: number) => void
+): Promise<BatchState> => {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    files.forEach((f) => form.append("files", f));
+
+    const xhr = new XMLHttpRequest();
+
+    // Track actual network upload progress
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    });
+
+    xhr.addEventListener("load", () => {
+      try {
+        const data = JSON.parse(xhr.responseText) as { batch: BatchState } | ApiError;
+        if (xhr.status >= 200 && xhr.status < 300 && "batch" in data) {
+          resolve(data.batch);
+        } else {
+          reject(new Error("error" in data ? data.error : "Failed to upload files"));
+        }
+      } catch {
+        reject(new Error("Failed to parse server response"));
+      }
+    });
+
+    xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
+
+    xhr.open("POST", "/api/batches");
+    xhr.send(form);
+  });
 };
 
 const startProcessing = async (batchId: string): Promise<void> => {
@@ -119,6 +148,7 @@ export function InvoiceApp() {
   const [batch, setBatch] = useState<BatchState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showTokenTable, setShowTokenTable] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -155,11 +185,14 @@ export function InvoiceApp() {
     try {
       setBusy(true);
       setError(null);
-      const created = await uploadFiles(selectedFiles);
+      setUploadPct(0);
+      const created = await uploadFiles(selectedFiles, setUploadPct);
+      setUploadPct(null);
       setBatch(created);
       await startProcessing(created.id);
       beginPolling(created.id);
     } catch (e) {
+      setUploadPct(null);
       setError(e instanceof Error ? e.message : "Failed to start processing");
     } finally {
       setBusy(false);
@@ -278,11 +311,31 @@ export function InvoiceApp() {
 
           {/* Upload-phase loading overlay */}
           {busy && (
-            <div className="mt-4 flex items-center gap-3 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
-              <Spinner />
-              <span>
-                Uploading {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""} to server… please wait
-              </span>
+            <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
+              {uploadPct !== null ? (
+                /* Uploading: show real % progress bar */
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Spinner />
+                      <span>Uploading to server…</span>
+                    </div>
+                    <span className="font-semibold">{uploadPct}%</span>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-teal-200">
+                    <div
+                      className="h-full rounded-full bg-teal-500 transition-all duration-300"
+                      style={{ width: `${uploadPct}%` }}
+                    />
+                  </div>
+                </div>
+              ) : (
+                /* Processing on server: ZIP extraction + saving */
+                <div className="flex items-center gap-2">
+                  <Spinner />
+                  <span>Extracting files on server… please wait</span>
+                </div>
+              )}
             </div>
           )}
         </section>
