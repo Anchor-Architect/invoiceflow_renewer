@@ -11,11 +11,14 @@ type InternalBatchState = BatchState & {
 // This survives instance restarts; without it, state is lost if the instance recycles.
 const DATA_DIR = process.env.BATCH_DATA_DIR || path.join(process.cwd(), ".data", "batches");
 
+// Exported so other modules (e.g. processBatch) can resolve paths under the same root
+export const getBatchDir = (batchId: string) => path.join(DATA_DIR, batchId);
+
 const ensureDataDir = () => {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 };
 
-const batchDir = (batchId: string) => path.join(DATA_DIR, batchId);
+const batchDir = getBatchDir;
 const batchStatePath = (batchId: string) => path.join(batchDir(batchId), "state.json");
 
 const writeState = (state: InternalBatchState) => {

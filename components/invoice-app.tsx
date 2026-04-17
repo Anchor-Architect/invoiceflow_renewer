@@ -268,6 +268,21 @@ export function InvoiceApp() {
     }
   };
 
+  // Resume processing after a server restart — re-triggers /process which skips already-done invoices
+  const onResume = async () => {
+    if (!batch) return;
+    try {
+      setBusy(true);
+      setError(null);
+      await startProcessing(batch.id);
+      beginPolling(batch.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to resume processing");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onInsert = async () => {
     if (!batch) return;
     try {
@@ -711,10 +726,20 @@ export function InvoiceApp() {
       {error && (
         <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
           <span className="text-lg">⚠</span>
-          <div>
+          <div className="flex-1">
             <p className="font-semibold">Error</p>
             <p className="mt-0.5 text-xs">{error}</p>
           </div>
+          {/* Show Resume button if server restarted mid-processing */}
+          {error.includes("restarted") && batch && !batch.completed && (
+            <button
+              onClick={onResume}
+              disabled={busy}
+              className="shrink-0 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              ↻ Resume Processing
+            </button>
+          )}
         </div>
       )}
     </main>

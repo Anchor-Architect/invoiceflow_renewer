@@ -14,7 +14,8 @@ export async function POST(
     return NextResponse.json({ error: "Batch not found" }, { status: 404 });
   }
 
-  if (!batch.started) {
+  // Allow re-triggering if batch was interrupted (started but not completed)
+  if (!batch.started || (batch.started && !batch.completed)) {
     void processBatch(batchId).catch((err) => {
       console.error("Batch processing failed", err);
     });

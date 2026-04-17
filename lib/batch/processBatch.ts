@@ -1,5 +1,5 @@
 import { workerPool } from "@/lib/queue/workerPool";
-import { getBatch, setProcessedInvoices, updateBatch } from "@/lib/storage/batchStore";
+import { getBatch, getBatchDir, setProcessedInvoices, updateBatch } from "@/lib/storage/batchStore";
 import { extractPdfText } from "@/lib/pdf/extract";
 import { toPurchaseRow, toSalesRow } from "@/lib/transform/rows";
 import type { BatchTokenSummary, ProcessedInvoice, ReviewReason, TokenUsage } from "@/types/invoice";
@@ -55,21 +55,37 @@ export const processBatch = async (batchId: string): Promise<void> => {
   const batch = getBatch(batchId);
   if (!batch) throw new Error("Batch not found");
 
-  // Default concurrency of 2 avoids Claude API rate limits on lower tiers.
-  // Raise via INVOICE_CONCURRENCY env var if on Tier 2+ (1,000 RPM).
   const concurrency = Math.max(1, Number(process.env.INVOICE_CONCURRENCY || 2));
-  const results: ProcessedInvoice[] = [];
-  const allTokenUsages: TokenUsage[] = [];
+
+  // Resume support: load any results already saved from a previous interrupted run
+  const results: ProcessedInvoice[] = [...(batch.processedInvoices ?? [])];
+  const allTokenUsages: TokenUsage[] = results
+    .filter((r) => r.tokenUsage != null)
+    .map((r) => r.tokenUsage as TokenUsage);
+
+  const processedFileIds = new Set(results.map((r) => r.fileId));
+  const remainingFiles = batch.sourceFiles.filter((f) => !processedFileIds.has(f.id));
+
+  // If everything was already processed (e.g. re-trigger after completion), bail out
+  if (remainingFiles.length === 0) {
+    updateBatch(batchId, (b) => {
+      b.progress.percentage = 100;
+      b.progress.stage = "Ready for insertion";
+      b.completed = true;
+    });
+    return;
+  }
 
   updateBatch(batchId, (b) => {
     b.started = true;
     b.completed = false;
     b.progress.stage = "Extracting text";
-    b.progress.processed = 0;
-    b.progress.percentage = 0;
+    // Keep processed count from previous run so progress bar doesn't reset
+    b.progress.processed = results.length;
+    b.progress.percentage = Math.round((results.length / b.progress.total) * 100);
   });
 
-  await workerPool(batch.sourceFiles, concurrency, async (file) => {
+  await workerPool(remainingFiles, concurrency, async (file) => {
     let local: ProcessedInvoice;
 
     try {
@@ -147,7 +163,10 @@ export const processBatch = async (batchId: string): Promise<void> => {
     }
 
     results.push(local);
+
+    // Save result immediately after each invoice — survives instance restart
     updateBatch(batchId, (b) => {
+      b.processedInvoices = results.map((r) => ({ ...r, pipelineTrace: undefined }));
       b.progress.processed = results.length;
       b.progress.percentage = Math.round((results.length / b.progress.total) * 100);
       b.progress.valid = results.filter((r) => r.status === "valid").length;
@@ -158,7 +177,7 @@ export const processBatch = async (batchId: string): Promise<void> => {
 
   detectDuplicates(results);
 
-  // Aggregate token summary across all invoices
+  // Aggregate token summary across all invoices (including resumed ones)
   if (allTokenUsages.length > 0) {
     const model = allTokenUsages[0].model;
     const totalInput = allTokenUsages.reduce((s, t) => s + t.input, 0);
@@ -172,8 +191,8 @@ export const processBatch = async (batchId: string): Promise<void> => {
     updateBatch(batchId, (b) => { b.tokenSummary = tokenSummary; });
   }
 
-  // Persist trace for audit
-  const traceDir = `.data/batches/${batchId}`;
+  // Persist trace for audit — use DATA_DIR-aware path
+  const traceDir = getBatchDir(batchId);
   await fs.mkdir(traceDir, { recursive: true });
   await fs.writeFile(
     `${traceDir}/trace.jsonl`,
