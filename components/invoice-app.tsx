@@ -7,13 +7,13 @@ import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/in
 
 type ApiError = { error: string };
 
-const CHUNK_SIZE = 5; // files per chunk — keeps each request under ~2 MB
+const UPLOAD_CONCURRENCY = 5; // parallel single-file uploads
 
-// If user uploaded a ZIP, extract PDFs from it client-side before chunked upload.
+// If user uploaded a ZIP, extract PDFs from it client-side before uploading.
 // This avoids sending one large ZIP request through Render's proxy.
-const expandTopdfs = async (inputFiles: File[]): Promise<File[]> => {
+const expandToPdfs = async (inputFiles: File[]): Promise<File[]> => {
   const zipFile = inputFiles.find((f) => f.name.toLowerCase().endsWith(".zip"));
-  if (!zipFile) return inputFiles; // already individual PDFs
+  if (!zipFile) return inputFiles;
 
   const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(await zipFile.arrayBuffer());
@@ -33,44 +33,43 @@ const expandTopdfs = async (inputFiles: File[]): Promise<File[]> => {
   return pdfFiles;
 };
 
-// Upload a single chunk via XHR and track its byte-level progress.
-const uploadChunk = (
+// Upload one file via XHR — each request is ~300 KB, bypassing Render proxy throttle
+const uploadOneFile = (
   batchId: string,
-  files: File[],
+  file: File,
   onBytes: (loaded: number, total: number) => void
-): Promise<BatchState> => {
+): Promise<{ fileId: string; fileName: string; filePath: string }> => {
   return new Promise((resolve, reject) => {
     const form = new FormData();
-    files.forEach((f) => form.append("files", f));
+    form.append("file", file);
     const xhr = new XMLHttpRequest();
     xhr.upload.addEventListener("progress", (e) => {
       if (e.lengthComputable) onBytes(e.loaded, e.total);
     });
     xhr.addEventListener("load", () => {
       try {
-        const data = JSON.parse(xhr.responseText) as { batch: BatchState } | ApiError;
-        if (xhr.status >= 200 && xhr.status < 300 && "batch" in data) resolve(data.batch);
-        else reject(new Error("error" in data ? data.error : "Failed to upload chunk"));
+        const data = JSON.parse(xhr.responseText);
+        if (xhr.status >= 200 && xhr.status < 300 && "fileId" in data) resolve(data);
+        else reject(new Error(data.error ?? "Failed to upload file"));
       } catch {
         reject(new Error("Failed to parse server response"));
       }
     });
-    xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
-    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
-    xhr.open("POST", `/api/batches/${batchId}/files`);
+    xhr.addEventListener("error", () => reject(new Error(`Network error uploading ${file.name}`)));
+    xhr.open("POST", `/api/batches/${batchId}/file`);
     xhr.send(form);
   });
 };
 
-// Chunked upload: extract ZIP if needed → init batch → upload N files at a time → return final state.
+// Parallel upload: extract ZIP if needed → init batch → upload files N at a time → finalize
 const uploadFiles = async (
   files: File[],
   onProgress: (pct: number) => void
 ): Promise<BatchState> => {
-  // Step 0: if ZIP, extract client-side so we never send a huge single request
-  const pdfs = await expandTopdfs(files);
+  // Step 0: extract ZIP client-side (so we never send a large single request)
+  const pdfs = await expandToPdfs(files);
 
-  // Step 1: init empty batch with total count
+  // Step 1: init empty batch
   const initRes = await fetch("/api/batches/init", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -82,26 +81,40 @@ const uploadFiles = async (
   }
   const batchId = initData.batch.id;
 
-  // Step 2: upload files in chunks
+  // Step 2: upload all files in parallel (UPLOAD_CONCURRENCY at a time)
   const totalBytes = pdfs.reduce((s, f) => s + f.size, 0);
-  let bytesUploaded = 0;
-  const chunks: File[][] = [];
-  for (let i = 0; i < pdfs.length; i += CHUNK_SIZE) {
-    chunks.push(pdfs.slice(i, i + CHUNK_SIZE));
-  }
+  const bytesPerFile = new Array(pdfs.length).fill(0);
+  const uploadedFiles: { fileId: string; fileName: string; filePath: string }[] = [];
 
-  let lastBatch: BatchState = initData.batch;
-  for (const chunk of chunks) {
-    const chunkBase = bytesUploaded;
-    lastBatch = await uploadChunk(batchId, chunk, (loaded, total) => {
-      const pct = Math.round(((chunkBase + (loaded / total) * chunk.reduce((s, f) => s + f.size, 0)) / totalBytes) * 100);
-      onProgress(Math.min(pct, 99));
-    });
-    bytesUploaded += chunk.reduce((s, f) => s + f.size, 0);
+  const queue = [...pdfs.entries()]; // [[index, file], ...]
+  const workers = Array.from({ length: UPLOAD_CONCURRENCY }, async () => {
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (!next) break;
+      const [idx, file] = next;
+      const result = await uploadOneFile(batchId, file, (loaded, total) => {
+        bytesPerFile[idx] = (loaded / total) * file.size;
+        const sent = bytesPerFile.reduce((s, b) => s + b, 0);
+        onProgress(Math.min(Math.round((sent / totalBytes) * 100), 99));
+      });
+      uploadedFiles.push(result);
+    }
+  });
+  await Promise.all(workers);
+
+  // Step 3: finalize — commit file list to state.json
+  const finalizeRes = await fetch(`/api/batches/${batchId}/finalize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ files: uploadedFiles })
+  });
+  const finalizeData = (await finalizeRes.json()) as { batch: BatchState } | ApiError;
+  if (!finalizeRes.ok || !("batch" in finalizeData)) {
+    throw new Error("error" in finalizeData ? finalizeData.error : "Failed to finalize batch");
   }
 
   onProgress(100);
-  return lastBatch;
+  return finalizeData.batch;
 };
 
 const startProcessing = async (batchId: string): Promise<void> => {
