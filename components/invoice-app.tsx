@@ -7,42 +7,101 @@ import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/in
 
 type ApiError = { error: string };
 
-const uploadFiles = (
+const CHUNK_SIZE = 5; // files per chunk — keeps each request under ~2 MB
+
+// If user uploaded a ZIP, extract PDFs from it client-side before chunked upload.
+// This avoids sending one large ZIP request through Render's proxy.
+const expandTopdfs = async (inputFiles: File[]): Promise<File[]> => {
+  const zipFile = inputFiles.find((f) => f.name.toLowerCase().endsWith(".zip"));
+  if (!zipFile) return inputFiles; // already individual PDFs
+
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(await zipFile.arrayBuffer());
+  const pdfFiles: File[] = [];
+
+  await Promise.all(
+    Object.entries(zip.files).map(async ([name, entry]) => {
+      if (!entry.dir && name.toLowerCase().endsWith(".pdf")) {
+        const content = await entry.async("arraybuffer");
+        const fileName = name.split("/").at(-1) ?? name;
+        pdfFiles.push(new File([content], fileName, { type: "application/pdf" }));
+      }
+    })
+  );
+
+  if (pdfFiles.length === 0) throw new Error("ZIP does not contain any PDF files");
+  return pdfFiles;
+};
+
+// Upload a single chunk via XHR and track its byte-level progress.
+const uploadChunk = (
+  batchId: string,
   files: File[],
-  onProgress: (pct: number) => void
+  onBytes: (loaded: number, total: number) => void
 ): Promise<BatchState> => {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
-
     const xhr = new XMLHttpRequest();
-
-    // Track actual network upload progress
     xhr.upload.addEventListener("progress", (e) => {
-      if (e.lengthComputable) {
-        onProgress(Math.round((e.loaded / e.total) * 100));
-      }
+      if (e.lengthComputable) onBytes(e.loaded, e.total);
     });
-
     xhr.addEventListener("load", () => {
       try {
         const data = JSON.parse(xhr.responseText) as { batch: BatchState } | ApiError;
-        if (xhr.status >= 200 && xhr.status < 300 && "batch" in data) {
-          resolve(data.batch);
-        } else {
-          reject(new Error("error" in data ? data.error : "Failed to upload files"));
-        }
+        if (xhr.status >= 200 && xhr.status < 300 && "batch" in data) resolve(data.batch);
+        else reject(new Error("error" in data ? data.error : "Failed to upload chunk"));
       } catch {
         reject(new Error("Failed to parse server response"));
       }
     });
-
     xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
     xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
-
-    xhr.open("POST", "/api/batches");
+    xhr.open("POST", `/api/batches/${batchId}/files`);
     xhr.send(form);
   });
+};
+
+// Chunked upload: extract ZIP if needed → init batch → upload N files at a time → return final state.
+const uploadFiles = async (
+  files: File[],
+  onProgress: (pct: number) => void
+): Promise<BatchState> => {
+  // Step 0: if ZIP, extract client-side so we never send a huge single request
+  const pdfs = await expandTopdfs(files);
+
+  // Step 1: init empty batch with total count
+  const initRes = await fetch("/api/batches/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ total: pdfs.length })
+  });
+  const initData = (await initRes.json()) as { batch: BatchState } | ApiError;
+  if (!initRes.ok || !("batch" in initData)) {
+    throw new Error("error" in initData ? initData.error : "Failed to init batch");
+  }
+  const batchId = initData.batch.id;
+
+  // Step 2: upload files in chunks
+  const totalBytes = pdfs.reduce((s, f) => s + f.size, 0);
+  let bytesUploaded = 0;
+  const chunks: File[][] = [];
+  for (let i = 0; i < pdfs.length; i += CHUNK_SIZE) {
+    chunks.push(pdfs.slice(i, i + CHUNK_SIZE));
+  }
+
+  let lastBatch: BatchState = initData.batch;
+  for (const chunk of chunks) {
+    const chunkBase = bytesUploaded;
+    lastBatch = await uploadChunk(batchId, chunk, (loaded, total) => {
+      const pct = Math.round(((chunkBase + (loaded / total) * chunk.reduce((s, f) => s + f.size, 0)) / totalBytes) * 100);
+      onProgress(Math.min(pct, 99));
+    });
+    bytesUploaded += chunk.reduce((s, f) => s + f.size, 0);
+  }
+
+  onProgress(100);
+  return lastBatch;
 };
 
 const startProcessing = async (batchId: string): Promise<void> => {
@@ -149,6 +208,7 @@ export function InvoiceApp() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [uploadPhase, setUploadPhase] = useState<"extracting-zip" | "uploading" | "saving">("uploading");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showTokenTable, setShowTokenTable] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -186,7 +246,16 @@ export function InvoiceApp() {
       setBusy(true);
       setError(null);
       setUploadPct(0);
-      const created = await uploadFiles(selectedFiles, setUploadPct);
+      // If ZIP, show extraction phase first
+      if (selectedFiles.some((f) => f.name.toLowerCase().endsWith(".zip"))) {
+        setUploadPhase("extracting-zip");
+      } else {
+        setUploadPhase("uploading");
+      }
+      const created = await uploadFiles(selectedFiles, (pct) => {
+        setUploadPhase("uploading");
+        setUploadPct(pct);
+      });
       setUploadPct(null);
       setBatch(created);
       await startProcessing(created.id);
@@ -312,8 +381,14 @@ export function InvoiceApp() {
           {/* Upload-phase loading overlay */}
           {busy && (
             <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
-              {uploadPct !== null ? (
-                /* Uploading: show real % progress bar */
+              {uploadPhase === "extracting-zip" ? (
+                /* Step 0: extracting ZIP client-side */
+                <div className="flex items-center gap-2">
+                  <Spinner />
+                  <span>Extracting ZIP file… please wait</span>
+                </div>
+              ) : uploadPct !== null ? (
+                /* Step 1: chunked network upload with real % */
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
@@ -330,10 +405,10 @@ export function InvoiceApp() {
                   </div>
                 </div>
               ) : (
-                /* Processing on server: ZIP extraction + saving */
+                /* Step 2: saving on server */
                 <div className="flex items-center gap-2">
                   <Spinner />
-                  <span>Extracting files on server… please wait</span>
+                  <span>Saving files on server… please wait</span>
                 </div>
               )}
             </div>
