@@ -7,7 +7,7 @@ import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/in
 
 type ApiError = { error: string };
 
-const UPLOAD_CONCURRENCY = 5; // parallel single-file uploads
+const UPLOAD_CONCURRENCY = 2; // keep low — Render proxy throttles concurrent POSTs
 
 // If user uploaded a ZIP, extract PDFs from it client-side before uploading.
 // This avoids sending one large ZIP request through Render's proxy.
@@ -56,6 +56,8 @@ const uploadOneFile = (
       }
     });
     xhr.addEventListener("error", () => reject(new Error(`Network error uploading ${file.name}`)));
+    xhr.timeout = 30_000; // 30s per file — plenty for ~300 KB
+    xhr.addEventListener("timeout", () => reject(new Error(`Upload timed out: ${file.name}`)));
     xhr.open("POST", `/api/batches/${batchId}/file`);
     xhr.send(form);
   });
