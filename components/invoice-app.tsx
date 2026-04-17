@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import type { BatchState, BatchTokenSummary, ProcessedInvoice } from "@/types/invoice";
 
 // ─── API helpers ────────────────────────────────────────────────────────────
@@ -33,23 +33,29 @@ const expandToPdfs = async (inputFiles: File[]): Promise<File[]> => {
 };
 
 // Extract plain text from a PDF file in the browser using PDF.js
+let _pdfjsInitialized = false;
 const extractTextFromPdf = async (file: File): Promise<string> => {
   const pdfjsLib = await import("pdfjs-dist");
-  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+
+  // Set worker once per session
+  if (!_pdfjsInitialized) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+    _pdfjsInitialized = true;
+  }
 
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
-  let fullText = "";
+  const pageTexts: string[] = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items
-      .map((item) => ("str" in item ? item.str : ""))
-      .join(" ");
-    fullText += pageText + "\n";
+    pageTexts.push(
+      content.items.map((item) => ("str" in item ? item.str : "")).join(" ")
+    );
   }
-  return fullText.replace(/\s+\n/g, "\n").trim();
+  return pageTexts.join("\n").replace(/\s+\n/g, "\n").trim();
 };
 
 // Send extracted text to server for AI analysis (tiny JSON, no file upload)
