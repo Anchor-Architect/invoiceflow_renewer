@@ -8,13 +8,17 @@ export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
-    const { fileName, text } = (await request.json()) as {
+    const { fileName, text, invoiceType } = (await request.json()) as {
       fileName: string;
       text: string;
+      invoiceType?: "Purchase" | "Sales";
     };
 
     if (!fileName || !text) {
       return NextResponse.json({ error: "fileName and text are required" }, { status: 400 });
+    }
+    if (invoiceType !== "Purchase" && invoiceType !== "Sales") {
+      return NextResponse.json({ error: "invoiceType must be Purchase or Sales" }, { status: 400 });
     }
 
     const pipeline = await processInvoicePipeline(text);
@@ -30,25 +34,20 @@ export async function POST(request: Request) {
     let purchaseRow = null;
     let salesRow = null;
 
+    const effectiveInvoiceType = invoiceType;
+
     if (status === "valid") {
-      if (pipeline.invoiceType === "Purchase") {
+      if (effectiveInvoiceType === "Purchase") {
         purchaseRow = toPurchaseRow(pipeline.extraction, pipeline.validation);
-      } else if (pipeline.invoiceType === "Sales") {
+      } else if (effectiveInvoiceType === "Sales") {
         salesRow = toSalesRow(pipeline.extraction, pipeline.validation);
-      } else {
-        status = "review-needed";
-        reasons.push({
-          type: "Ambiguous",
-          reason: "Invoice type (Purchase/Sales) could not be determined",
-          evidence: []
-        });
       }
     }
 
     const result: ProcessedInvoice = {
       fileId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       fileName,
-      type: pipeline.invoiceType,
+      type: effectiveInvoiceType,
       status,
       extraction: pipeline.extraction,
       validation: pipeline.validation,

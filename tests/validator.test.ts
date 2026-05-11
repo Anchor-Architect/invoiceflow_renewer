@@ -65,3 +65,25 @@ describe("amount validation", () => {
     expect(issues.some((i) => i.code === "amount_mismatch")).toBe(true);
   });
 });
+
+describe("invoice number length by invoice type", () => {
+  it("allows 1-character invoice number for Sales", () => {
+    const issues = validateNormalizedInvoice(
+      { ...extracted, invoice_number: { ...extracted.invoice_number, value: "6" } },
+      { ...normalized, invoice_number: "6" },
+      { invoiceType: "Sales", reason: "seller matches" },
+      false
+    );
+    expect(issues.some((i) => i.code === "invoice_number_short")).toBe(false);
+  });
+
+  it("keeps 3-character minimum for Purchase", () => {
+    const issues = validateNormalizedInvoice(
+      { ...extracted, invoice_number: { ...extracted.invoice_number, value: "6" } },
+      { ...normalized, invoice_number: "6" },
+      { invoiceType: "Purchase", reason: "buyer matches" },
+      false
+    );
+    expect(issues.some((i) => i.code === "invoice_number_short")).toBe(true);
+  });
+});

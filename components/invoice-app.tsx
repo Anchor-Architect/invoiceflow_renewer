@@ -35,12 +35,13 @@ const expandToPdfs = async (inputFiles: File[]): Promise<File[]> => {
 // Extract plain text from a PDF file in the browser using PDF.js
 let _pdfjsInitialized = false;
 const extractTextFromPdf = async (file: File): Promise<string> => {
-  const pdfjsLib = await import("pdfjs-dist");
+  // Use legacy bundle path for wider browser/runtime compatibility in Next apps.
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
 
   // Set worker once per session
   if (!_pdfjsInitialized) {
     pdfjsLib.GlobalWorkerOptions.workerSrc =
-      `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+      `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/legacy/build/pdf.worker.min.mjs`;
     _pdfjsInitialized = true;
   }
 
@@ -58,15 +59,37 @@ const extractTextFromPdf = async (file: File): Promise<string> => {
   return pageTexts.join("\n").replace(/\s+\n/g, "\n").trim();
 };
 
+const extractTextFallbackServer = async (file: File): Promise<string> => {
+  const form = new FormData();
+  form.append("file", file);
+
+  const res = await fetch("/api/pdf-text", { method: "POST", body: form });
+  const data = (await res.json()) as { text: string } | ApiError;
+  if (!res.ok || !("text" in data)) {
+    throw new Error("error" in data ? data.error : "Server fallback extraction failed");
+  }
+  return data.text;
+};
+
+const extractTextWithFallback = async (file: File): Promise<string> => {
+  try {
+    return await extractTextFromPdf(file);
+  } catch {
+    // Fallback when client-side PDF.js fails for specific PDFs/runtime environments.
+    return extractTextFallbackServer(file);
+  }
+};
+
 // Send extracted text to server for AI analysis (tiny JSON, no file upload)
 const analyzeInvoice = async (
   fileName: string,
-  text: string
+  text: string,
+  invoiceType: "Purchase" | "Sales"
 ): Promise<ProcessedInvoice> => {
   const res = await fetch("/api/process-invoice", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fileName, text })
+    body: JSON.stringify({ fileName, text, invoiceType })
   });
   const data = (await res.json()) as { result: ProcessedInvoice } | ApiError;
   if (!res.ok || !("result" in data)) {
@@ -224,6 +247,9 @@ export function InvoiceApp() {
   const [dragOver, setDragOver] = useState(false);
   const [activeTab, setActiveTab] = useState<"all" | "valid" | "review" | "failed">("all");
   const [previewTab, setPreviewTab] = useState<"Purchase" | "Sales">("Purchase");
+  const [selectedInvoiceType, setSelectedInvoiceType] = useState<"Purchase" | "Sales">(
+    "Purchase"
+  );
 
   const onDropFiles = (incoming: FileList | null) => {
     if (!incoming) return;
@@ -264,7 +290,7 @@ export function InvoiceApp() {
       setUploadPhase("extracting-text");
       const texts: { file: File; text: string }[] = [];
       for (let i = 0; i < pdfs.length; i++) {
-        const text = await extractTextFromPdf(pdfs[i]);
+        const text = await extractTextWithFallback(pdfs[i]);
         texts.push({ file: pdfs[i], text });
         setUploadPct(Math.round(((i + 1) / pdfs.length) * 100));
       }
@@ -282,7 +308,7 @@ export function InvoiceApp() {
           if (!next) break;
           let result: ProcessedInvoice;
           try {
-            result = await analyzeInvoice(next.file.name, next.text);
+            result = await analyzeInvoice(next.file.name, next.text, selectedInvoiceType);
           } catch (e) {
             result = {
               fileId: `err-${Date.now()}`,
@@ -407,80 +433,106 @@ export function InvoiceApp() {
 
       {/* ── Upload ── */}
       {!batch && (
-        <section className="panel">
-          <h2 className="section-title">Upload Files</h2>
-          <div
-            className={`relative rounded-xl border-2 border-dashed p-8 text-center transition-colors ${
-              dragOver ? "border-accent bg-teal-50" : "border-slate-300 bg-slate-50 hover:border-slate-400"
-            }`}
-            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(e) => { e.preventDefault(); setDragOver(false); onDropFiles(e.dataTransfer.files); }}
-          >
-            <div className="pointer-events-none mb-3 text-3xl">📄</div>
-            <p className="text-sm font-medium text-slate-700">
-              Drag &amp; drop invoice PDFs or a ZIP file, or click to browse
-            </p>
-            <p className="mt-1 text-xs text-slate-400">Up to 200 PDFs or one ZIP archive</p>
-            <input
-              className="absolute inset-0 cursor-pointer opacity-0"
-              type="file"
-              multiple
-              accept=".pdf,.zip"
-              onChange={(e) => onDropFiles(e.target.files)}
-            />
-          </div>
-
-          {selectedFiles.length > 0 && (
-            <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-slate-200 bg-white">
-              <ul className="divide-y divide-slate-100 text-sm">
-                {selectedFiles.map((file) => (
-                  <li
-                    key={`${file.name}-${file.size}`}
-                    className="flex items-center justify-between px-4 py-2"
-                  >
-                    <span className="truncate text-slate-700">{file.name}</span>
-                    <span className="ml-4 shrink-0 text-xs text-slate-400">
-                      {(file.size / 1024).toFixed(0)} KB
-                    </span>
-                  </li>
-                ))}
-              </ul>
+        <>
+          <section className="panel">
+            <h2 className="section-title">Upload Files</h2>
+            <div
+              className={`relative rounded-xl border-2 border-dashed p-8 text-center transition-colors ${
+                dragOver ? "border-accent bg-teal-50" : "border-slate-300 bg-slate-50 hover:border-slate-400"
+              }`}
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => { e.preventDefault(); setDragOver(false); onDropFiles(e.dataTransfer.files); }}
+            >
+              <div className="pointer-events-none mb-3 text-3xl">📄</div>
+              <p className="text-sm font-medium text-slate-700">
+                Drag &amp; drop invoice PDFs or a ZIP file, or click to browse
+              </p>
+              <p className="mt-1 text-xs text-slate-400">Up to 200 PDFs or one ZIP archive</p>
+              <input
+                className="absolute inset-0 cursor-pointer opacity-0"
+                type="file"
+                multiple
+                accept=".pdf,.zip"
+                onChange={(e) => onDropFiles(e.target.files)}
+              />
             </div>
-          )}
 
-          <button
-            className="mt-4 flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-teal-700 disabled:opacity-50"
-            onClick={onStart}
-            disabled={busy || selectedFiles.length === 0}
-          >
-            &#9654; Start Processing ({selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""})
-          </button>
+            {selectedFiles.length > 0 && (
+              <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-slate-200 bg-white">
+                <ul className="divide-y divide-slate-100 text-sm">
+                  {selectedFiles.map((file) => (
+                    <li
+                      key={`${file.name}-${file.size}`}
+                      className="flex items-center justify-between px-4 py-2"
+                    >
+                      <span className="truncate text-slate-700">{file.name}</span>
+                      <span className="ml-4 shrink-0 text-xs text-slate-400">
+                        {(file.size / 1024).toFixed(0)} KB
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
-          {/* Upload-phase loading overlay */}
-          {busy && !batch && (
-            <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
-              {uploadPhase === "extracting-zip" ? (
-                <div className="flex items-center gap-2">
-                  <Spinner />
-                  <span>Extracting ZIP file…</span>
-                </div>
-              ) : uploadPhase === "extracting-text" && uploadPct !== null ? (
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2"><Spinner /><span>Reading PDF text…</span></div>
-                    <span className="font-semibold">{uploadPct}%</span>
+            <button
+              className="mt-4 flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-teal-700 disabled:opacity-50"
+              onClick={onStart}
+              disabled={busy || selectedFiles.length === 0}
+            >
+              &#9654; Start Processing ({selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""})
+            </button>
+
+            {/* Upload-phase loading overlay */}
+            {busy && !batch && (
+              <div className="mt-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-700">
+                {uploadPhase === "extracting-zip" ? (
+                  <div className="flex items-center gap-2">
+                    <Spinner />
+                    <span>Extracting ZIP file…</span>
                   </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-teal-200">
-                    <div className="h-full rounded-full bg-teal-500 transition-all duration-300" style={{ width: `${uploadPct}%` }} />
+                ) : uploadPhase === "extracting-text" && uploadPct !== null ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2"><Spinner /><span>Reading PDF text…</span></div>
+                      <span className="font-semibold">{uploadPct}%</span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-teal-200">
+                      <div className="h-full rounded-full bg-teal-500 transition-all duration-300" style={{ width: `${uploadPct}%` }} />
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2"><Spinner /><span>Starting AI analysis…</span></div>
-              )}
+                ) : (
+                  <div className="flex items-center gap-2"><Spinner /><span>Starting AI analysis…</span></div>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <h2 className="section-title">Invoice Type</h2>
+            <div className="flex items-center gap-4 text-sm">
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="invoice-type"
+                  checked={selectedInvoiceType === "Purchase"}
+                  onChange={() => setSelectedInvoiceType("Purchase")}
+                />
+                Purchase
+              </label>
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="invoice-type"
+                  checked={selectedInvoiceType === "Sales"}
+                  onChange={() => setSelectedInvoiceType("Sales")}
+                />
+                Sales
+              </label>
             </div>
-          )}
-        </section>
+          </section>
+        </>
       )}
 
       {/* ── Progress ── */}

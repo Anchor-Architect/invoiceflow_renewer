@@ -182,13 +182,25 @@ export const validateNormalizedInvoice = (
   validateFieldExtraction(extracted, issues);
   validateClassification(classification, allowUnknownType, issues);
 
-  if ((normalized.invoice_number ?? "").length > 0 && (normalized.invoice_number ?? "").length < 3) {
-    pushIssue(issues, {
-      code: "invoice_number_short",
-      stage: "validation",
-      field: "invoice_number",
-      message: "invoice_number must be at least 3 characters"
-    });
+  const invoiceNoLen = (normalized.invoice_number ?? "").length;
+  if (invoiceNoLen > 0) {
+    if (classification.invoiceType === "Sales") {
+      if (invoiceNoLen < 1) {
+        pushIssue(issues, {
+          code: "invoice_number_short",
+          stage: "validation",
+          field: "invoice_number",
+          message: "invoice_number must be at least 1 character for Sales invoices"
+        });
+      }
+    } else if (classification.invoiceType === "Purchase" && invoiceNoLen < 3) {
+      pushIssue(issues, {
+        code: "invoice_number_short",
+        stage: "validation",
+        field: "invoice_number",
+        message: "invoice_number must be at least 3 characters for Purchase invoices"
+      });
+    }
   }
 
   return issues;
